@@ -87,12 +87,6 @@ conda env update --file "${this_dir}/environment.yml" --prune
 conda deactivate
 conda activate "${env_dir}"
 
-echo "installing gymnasium"
-pip3 install "gymnasium"
-pip3 install ale_py
-pip3 install mo-gymnasium[mujoco]  # requires here bc needs mujoco-py
-pip3 install "mujoco" -U
-
 # sanity check: remove?
 python3 -c """
 import dm_control
@@ -189,9 +183,14 @@ export MKL_THREADING_LAYER=GNU
 export CKPT_BACKEND=torch
 export MAX_IDLE_COUNT=100
 export BATCHED_PIPE_TIMEOUT=60
+export TORCHDYNAMO_INLINE_INBUILT_NN_MODULES=1
 
 pytest test/smoke_test.py -v --durations 200
 pytest test/smoke_test_deps.py -v --durations 200 -k 'test_gym or test_dm_control_pixels or test_dm_control or test_tb'
+
+# Check that benchmarks run
+python -m pytest benchmarks
+
 if [ "${CU_VERSION:-}" != cpu ] ; then
   python .github/unittest/helpers/coverage_run_parallel.py -m pytest test \
     --instafail --durations 200 -vv --capture no --ignore test/test_rlhf.py \
