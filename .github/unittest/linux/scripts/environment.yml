@@ -15,6 +15,7 @@ dependencies:
     - pytest-cov
     - pytest-mock
     - pytest-instafail
+    - pytest-benchmark
     - pytest-rerunfailures
     - pytest-timeout
     - expecttest
@@ -33,3 +34,5 @@ dependencies:
     - transformers
     - ninja
     - timm
+    - gymnasium[atari,accept-rom-license]
+    - mo-gymnasium[mujoco]
