@@ -525,10 +525,7 @@ class PPOLoss(LossModule):
             self.actor_network
         ) if self.functional else contextlib.nullcontext():
             dist = self.actor_network.get_dist(tensordict)
-        if isinstance(dist, CompositeDistribution):
-            is_composite = True
-        else:
-            is_composite = False
+        is_composite = isinstance(dist, CompositeDistribution)
 
         # current log_prob of actions
         if is_composite:
@@ -545,6 +542,32 @@ class PPOLoss(LossModule):
         prev_log_prob = _maybe_get_or_select(
             tensordict, self.tensor_keys.sample_log_prob
         )
+        # TODO:
+        # # current log_prob of actions
+        # action = _maybe_get_or_select(tensordict, self.tensor_keys.action)
+        #
+        # is_composite = None
+        # if all(key in tensordict for key in self.actor_network.dist_params_keys):
+        #     prev_dist = self.actor_network.build_dist_from_params(tensordict.detach())
+        #     kwargs, is_composite = _get_composite_kwargs(prev_dist)
+        #     if is_composite:
+        #         prev_log_prob = prev_dist.log_prob(tensordict, **kwargs)
+        #     else:
+        #         prev_log_prob = prev_dist.log_prob(action, **kwargs)
+        #     print('prev_log_prob', prev_log_prob)
+        # else:
+        #     try:
+        #         prev_log_prob = _maybe_get_or_select(
+        #             tensordict, self.tensor_keys.sample_log_prob
+        #         )
+        #     except KeyError as err:
+        #         raise _make_lp_get_error(self.tensor_keys, tensordict, err)
+
+        with self.actor_network_params.to_module(
+            self.actor_network
+        ) if self.functional else contextlib.nullcontext():
+            current_dist = self.actor_network.get_dist(tensordict)
+
 
         if prev_log_prob.requires_grad:
             raise RuntimeError(
@@ -566,20 +589,27 @@ class PPOLoss(LossModule):
                         "the beginning of your script to get a proper composite log-prob.",
                         category=UserWarning,
                     )
-                if (
-                    is_composite
-                    and not is_tensor_collection(prev_log_prob)
-                    and is_tensor_collection(log_prob)
-                ):
-                    log_prob = _sum_td_features(log_prob)
-                    log_prob.view_as(prev_log_prob)
+            # TODO:
+        # if isinstance(action, torch.Tensor):
+        #     log_prob = current_dist.log_prob(action)
+        # else:
+        #     if is_composite is None:
+        #         kwargs, is_composite = _get_composite_kwargs(current_dist)
+        #     log_prob: TensorDictBase = current_dist.log_prob(tensordict, **kwargs)
+            if (
+                is_composite
+                and not is_tensor_collection(prev_log_prob)
+                and is_tensor_collection(log_prob)
+            ):
+                log_prob = _sum_td_features(log_prob)
+                log_prob.view_as(prev_log_prob)
 
         log_weight = (log_prob - prev_log_prob).unsqueeze(-1)
         kl_approx = (prev_log_prob - log_prob).unsqueeze(-1)
         if is_tensor_collection(kl_approx):
             kl_approx = _sum_td_features(kl_approx)
 
-        return log_weight, dist, kl_approx
+        return log_weight, current_dist, kl_approx
 
     def loss_critic(self, tensordict: TensorDictBase) -> torch.Tensor:
         """Returns the critic loss multiplied by ``critic_coef``, if it is not ``None``."""
@@ -655,6 +685,9 @@ class PPOLoss(LossModule):
     @dispatch
     def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
         tensordict = tensordict.clone(False)
+
+        log_weight, dist, kl_approx = self._log_weight(tensordict)
+
         advantage = tensordict.get(self.tensor_keys.advantage, None)
         if advantage is None:
             self.value_estimator(
@@ -675,7 +708,6 @@ class PPOLoss(LossModule):
                 )
             advantage = _standardize(advantage, self.normalize_advantage_exclude_dims)
 
-        log_weight, dist, kl_approx = self._log_weight(tensordict)
         if is_tensor_collection(log_weight):
             log_weight = _sum_td_features(log_weight)
             log_weight = log_weight.view(advantage.shape)
