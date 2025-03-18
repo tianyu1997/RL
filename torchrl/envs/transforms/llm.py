@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
-from copy import copy
+from copy import copy, deepcopy
 from typing import Any, Callable, Iterable, Literal
 
 import torch
@@ -14,12 +14,14 @@ from tensordict import lazy_stack, NestedKey, TensorDict, TensorDictBase, unrave
 from tensordict.nn import (
     ProbabilisticTensorDictModule,
     ProbabilisticTensorDictSequential,
+    TensorDictParams,
 )
 from tensordict.utils import _zip_strict, is_seq_of_nested_key
+from torch import nn
 
 from torchrl.data.tensor_specs import Composite, NonTensor, TensorSpec, Unbounded
 from torchrl.envs.transforms.transforms import TensorDictPrimer, Transform
-from torchrl.envs.transforms.utils import _set_missing_tolerance
+from torchrl.envs.transforms.utils import _set_missing_tolerance, _stateless_param
 from torchrl.envs.utils import make_composite_from_td
 
 
@@ -366,9 +368,8 @@ class DataLoadingPrimer(TensorDictPrimer):
         if repeats is None:
             repeats = 0
         self.repeats = repeats
-        if (
-            getattr(dataloader, "batch_size", 1) > 1 and use_buffer is None
-        ) or repeats > 0:
+        batch_size = getattr(dataloader, "batch_size", 0)
+        if (batch_size > 1 and use_buffer is None) or repeats > 0:
             use_buffer = True
 
         self.use_buffer = use_buffer
@@ -376,9 +377,7 @@ class DataLoadingPrimer(TensorDictPrimer):
             self._queue = deque()
 
         # No auto_batch_size if we know we have a single element
-        self.auto_batch_size = auto_batch_size and (
-            getattr(dataloader, "batch_size", 1) > 0
-        )
+        self.auto_batch_size = auto_batch_size and (batch_size > 0)
         self.endless_dataloader = self._endless_iter(self.dataloader)
 
         if stack_method is None:
@@ -402,12 +401,16 @@ class DataLoadingPrimer(TensorDictPrimer):
                     for data_key, data_spec in _zip_strict(data_keys, data_specs)
                 }
             )
+            if batch_size:
+                primers = batch_size.expand(batch_size)
             self.data_keys = data_keys
         elif primers is None:
             self.data_keys = data_keys
             # We can get the primer from the dataloader itself
             data = self._load_from_dataloader()
             primers = make_composite_from_td(data, dynamic_shape=True)
+            if batch_size:
+                primers = primers.expand(batch_size)
             self._queue.insert(0, data)
             if data_keys is None:
                 self.data_keys = list(primers.keys(True, True))
@@ -578,6 +581,9 @@ class KLRewardTransform(Transform):
         in_keys=None,
         out_keys=None,
         requires_grad=False,
+        log_prob_key: NestedKey = "sample_log_prob",
+        action_key: NestedKey = "action",
+        functional: bool = True,
     ):
         if in_keys is None:
             in_keys = self.DEFAULT_IN_KEYS
@@ -603,36 +609,46 @@ class KLRewardTransform(Transform):
         # update the in_keys for dispatch etc
         self.in_keys = self.in_keys + actor.in_keys
 
+        self.functional = functional
         # check that the model has parameters
-        params = TensorDict.from_module(actor)
-        with params.apply(
-            _stateless_param, device="meta", filter_empty=False
-        ).to_module(actor):
-            # copy a stateless actor
-            self.__dict__["functional_actor"] = deepcopy(actor)
-        # we need to register these params as buffer to have `to` and similar
-        # methods work properly
+        if functional:
+            params = TensorDict.from_module(actor)
+            with params.apply(
+                _stateless_param, device="meta", filter_empty=False
+            ).to_module(actor):
+                # copy a stateless actor
+                self.__dict__["functional_actor"] = deepcopy(actor)
 
-        def _make_detached_param(x):
+            # we need to register these params as buffer to have `to` and similar
+            # methods work properly
 
-            if isinstance(x, nn.Parameter):
-                # we need an nn.Parameter since some modules (RNN) require nn.Parameters
-                return nn.Parameter(x.data.clone(), requires_grad=requires_grad)
-            elif x.requires_grad:
-                raise ValueError(
-                    "Encountered a value that requires gradients but is not an nn.Parameter instance."
+            def _make_detached_param(x):
+
+                if isinstance(x, nn.Parameter):
+                    # we need an nn.Parameter since some modules (RNN) require nn.Parameters
+                    return nn.Parameter(x.data.clone(), requires_grad=requires_grad)
+                elif x.requires_grad:
+                    raise ValueError(
+                        "Encountered a value that requires gradients but is not an nn.Parameter instance."
+                    )
+                return x.clone()
+
+            self.frozen_params = params.apply(_make_detached_param, filter_empty=False)
+            if requires_grad:
+                # includes the frozen params/buffers in the module parameters/buffers
+                self.frozen_params = TensorDictParams(
+                    self.frozen_params, no_convert=True
                 )
-            return x.clone()
 
-        self.frozen_params = params.apply(_make_detached_param, filter_empty=False)
-        if requires_grad:
-            # includes the frozen params/buffers in the module parameters/buffers
-            self.frozen_params = TensorDictParams(self.frozen_params, no_convert=True)
+        else:
+            self.__dict__["functional_actor"] = actor
 
         # self._buffers["actor_params"] = params.clone().detach()
 
+        self.action_key = action_key
+
         # find the sample log-prob key
-        self.sample_log_prob_key = "sample_log_prob"
+        self.sample_log_prob_key = log_prob_key
 
         def find_sample_log_prob(module):
             if hasattr(module, "log_prob_key"):
@@ -653,16 +669,31 @@ class KLRewardTransform(Transform):
 
     def _call(self, next_tensordict: TensorDictBase) -> TensorDictBase:
         # run the actor on the tensordict
-        action = next_tensordict.get("action", None)
+        action = next_tensordict.get(self.action_key, None)
         if action is None:
             # being called after reset or without action, skipping
             if self.out_keys[0] != ("reward",) and self.parent is not None:
                 next_tensordict.set(self.out_keys[0], self.parent.reward_spec.zero())
             return next_tensordict
-        with self.frozen_params.to_module(self.functional_actor):
-            dist = self.functional_actor.get_dist(next_tensordict.clone(False))
-        # get the log_prob given the original model
-        log_prob = dist.log_prob(action)
+
+        if self.functional:
+            with self.frozen_params.to_module(self.functional_actor):
+                dist = self.functional_actor.get_dist(next_tensordict.clone(False))
+            # get the log_prob given the original model
+            log_prob = dist.log_prob(action)
+        elif isinstance(
+            self.functional_actor,
+            (ProbabilisticTensorDictModule, ProbabilisticTensorDictSequential),
+        ):
+            # with self.frozen_params.to_module(self.functional_actor):
+            dist = self.functional_actor.get_dist(next_tensordict.copy())
+            # get the log_prob given the original model
+            log_prob = dist.log_prob(action)
+        else:
+            log_prob = self.functional_actor(next_tensordict.copy()).get(
+                self.sample_log_prob_key
+            )
+
         reward_key = self.in_keys[0]
         reward = next_tensordict.get("next").get(reward_key)
         curr_log_prob = next_tensordict.get(self.sample_log_prob_key)
@@ -685,12 +716,21 @@ class KLRewardTransform(Transform):
 
         if in_key == "reward" and out_key == "reward":
             parent = self.parent
+
+            reward_keys = parent.reward_keys
+            if len(reward_keys) == 1:
+                reward_key = reward_keys[0]
+            elif "reward" in reward_keys:
+                reward_key = "reward"
+            else:
+                raise KeyError("Couln't find the reward key.")
+
             reward_spec = Unbounded(
                 device=output_spec.device,
-                shape=output_spec["full_reward_spec"][parent.reward_key].shape,
+                shape=output_spec["full_reward_spec"][reward_key].shape,
             )
             output_spec["full_reward_spec"] = Composite(
-                {parent.reward_key: reward_spec},
+                {reward_key: reward_spec},
                 shape=output_spec["full_reward_spec"].shape,
             )
         elif in_key == "reward":
